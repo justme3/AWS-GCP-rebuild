@@ -1,0 +1,556 @@
+#!/bin/bash
+
+###set -x
+
+##########
+#  TODO
+#
+# - Keep logic structure intact but move the AWS and GCP code into modules for cleaner implimentation
+#
+# - Ensure and test capability to create new clusters that are NOT named the same as the user name.
+#
+# - Test that the user is logged in via sso
+#
+# - Update variable definitions to move away from ~/.* config files and to sso options
+#
+# - See if the removal of the ELB, ELBV2 etc can be cleaner by including cluster ID in query instead of testing all of them for ownership.
+#
+# - Test for functionality in other regions besides us-west-2
+#
+# - Report date and time at beginning of script.
+#
+# - Report data and time and elapsed time before "go run" initiates.
+#
+# - See if there is a cleaner way to ensure firewall-rules are updated and report to user
+#
+# - Remove the environment dump when clean sso is implemented
+#
+# - Cleanup or validate the aws-auth.yaml file, perhaps looking for critical values that need to be present????
+#
+# - There has to be a better way to ensure the GCP cluster is in a stable running state than waiting and checking continually.
+#
+# -
+#
+##########
+
+#
+# Exit status definitions
+#
+#  0		Successful completion
+#  1		Invalid cloud environment specified
+#  2		Terraform destroy experienced errors
+#  3		Terraform init experienced errors
+#  4		Terraform validate experienced errors
+#  5		The state directory does not exist and could not be created
+#  6		Terraform plan exerienced errors
+#  7		Terraform apply experienced errors
+#  8		The software deploy of cogynt failed
+#  9		Failed updating autoscaling group for destroy
+# 10		Failed updating autoscaling group for new cluster build
+# 11    Failed to delete elastic load balancer v1
+# 12    Failed to delete elastic load balancer v2
+# 13    Failed to delete unassociated Target Group
+# 14    Failed to delete target group
+# 15
+# 16
+# 17
+#
+
+USAGE="`basename ${0}` [aws|gcp]"
+START="`date`"
+
+# Validate input date and set variables
+if [[ "${1}" != "aws" && "${1}" != "gcp" ]]
+then
+	echo "ERROR: Supported environments are limited to 'aws' and 'gcp' only. Exiting"
+	echo ${USAGE}
+	exit 1
+else
+  echo ""
+  echo "STATUS: Beginning initial processing to determine the state of the current cluster."
+  echo ""
+	if [ "${1}" = "aws" ]
+	then
+		# Set the AWS variables
+    echo ""
+    echo "STATUS: Setting up the ${1} variables."
+    echo ""
+		USER=`whoami`
+    	VIRENV="aws"
+		PROFILE=`grep 'value: ' ${HOME}/.kube/config | awk '{print $NF}' | head -1`
+		AWS_PROFILE=`grep 'value: ' ${HOME}/.kube/config | awk '{print $NF}' | head -1`
+		CLUSTER=`cat ${HOME}/.aws/clustername`
+		K8SSYSTEM="eks"
+		REGION="us-west-2"
+		TERRAFORMDIR="${HOME}/git/infrastructure/terraform/providers/aws/cogynt/${REGION}/${K8SSYSTEM}/${CLUSTER}"
+		aws eks update-kubeconfig --name ${CLUSTER} 1>/dev/null 2>/dev/null
+    aws eks describe-cluster --name ${CLUSTER} 1>/dev/null 2>/dev/null
+		if [ "$?" -eq 0 ]
+		then
+			EXISTS=true
+		else
+			EXISTS=false
+		fi
+	else
+		# Set the GCP variables
+    echo ""
+    echo "STATUS: Setting up the ${1} variables."
+    echo ""
+		USER=`whoami`
+    	VIRENV="gcp"
+		CLUSTER="`gcloud config get account | awk -F\@ '{print $1}'`gcp"
+		K8SSYSTEM="gke"
+		REGION="us-west4"
+		TERRAFORMDIR="${HOME}/git/infrastructure/terraform/providers/gcp/cogynt/${REGION}/gke/${CLUSTER}"
+		gcloud container clusters get-credentials ${CLUSTER} --region ${REGION}
+    if [[ `gcloud container clusters list 2>/dev/null | grep -c ${CLUSTER}` > 0 ]]
+    then
+      EXISTS=true
+    else
+      EXISTS=false
+    fi
+	fi
+fi
+
+OPWD=`pwd`
+
+# Get there
+
+cd ${TERRAFORMDIR}
+
+if [[ "${EXISTS}" = "true" && ${VIRENV} = "aws" ]]
+then
+  # Tear down the old one
+  echo ""
+  echo "STATUS: Remove Terminate from the ${VIRENV} auto scaling groups to enable deletion"
+  echo "STATUS: Delete the load balancers that the ${CLUSTER} environment contains."
+  echo "STATUS: Delete the target groups associated with the load balancers that the ${CLUSTER} environment contains."
+  echo "STATUS: Delete any target groups un-associated with the load balancers that the ${CLUSTER} environment contains."
+  echo ""
+
+## Address all the dangling API issues in the environment
+## AWS does not do a good job removing these when destroying an environment
+
+# Remove load balancers with tag "kubernetes.io/cluster/<user>: owned"
+#   elb load balancer can NOT be selected based on tags. The "aws elb" command will only return those owned by "me"
+#   elbv2 load balancers can be selected by tags.
+#   Use both sets of code to cover all instances.
+
+# Handle the elb v1 load balancers -  no tags present so all those returned will be ones in the ${CLUSTER}
+
+  if [[ `aws elb describe-load-balancers | grep "\"LoadBalancerName\":" | grep -c "\"LoadBalancerName\":"` -le 0 ]]
+  then
+    echo "STATUS: No elb v1 load balancers to delete. Continuing."
+  else
+    for ELB in `aws elb describe-load-balancers | grep "\"LoadBalancerName\":" | grep "\"LoadBalancerName\":" | awk -F\" '{print $4}'`
+    do
+      aws elb delete-load-balancer --load-balancer-name ${ELB}
+	  if [ $? -ne 0 ]
+	  then
+			    echo "ERROR: Deleting Elastic Load Balancer ${ELB} failed. Exiting"
+	 	    exit 11
+      else
+        echo "STATUS: Successfully removed v1 load balancer ${ELB}. Continuing."
+	  fi
+    done
+  fi
+
+# Handle the elbv2 load balancers with the tag "kubernetes.io/cluster/${CLUSTER}: owned"
+
+  if [[ `aws elbv2 describe-load-balancers | jq -r '.LoadBalancers[].LoadBalancerArn' | grep -c elastic` -le 0 ]]
+  then
+    echo "STATUS: No elb v2 load balancers to delete. Continuing."
+  else
+    for ELB in `aws elbv2 describe-load-balancers | jq -r '.LoadBalancers[].LoadBalancerArn'`
+    do
+      if [[ `aws elbv2 describe-tags --resource-arns "${ELB}" | jq -ce '.TagDescriptions[].Tags[] | select( .Key == "kubernetes.io/cluster/'${CLUSTER}'" and .Value == "owned")' | grep -c "${CLUSTER}"` -ge 1 ]]
+      then
+        aws elbv2 delete-load-balancer --load-balancer-arn ${ELB}
+        if [ $? -ne 0 ]
+        then
+ 		      echo "ERROR: Deleting Elastic Load Balancer v2 ${ELB} failed. Exiting"
+ 		      exit 12
+        else
+          echo "STATUS: Successfully removed v2 load balancer ${ELB}. Continuing."
+        fi
+  
+      # Remove the target groups associated with the load balancer that has tag "kubernetes.io/cluster/${CLUSTER}: owned"
+
+        for TARGETGROUP in `aws elbv2 describe-target-groups --load-balancer-arn ${ELB} | jq -r '.TargetGroups[].TargetGroupArn'`
+        do
+          aws elbv2 delete-target-group --target-group-arn ${TARGETGROUP}
+          if [ $? -ne 0 ]
+          then
+ 		          echo "ERROR: Deleting Target Group ${TARGETGROUP} for Elastic Load Balancer v2 ${ELB} failed. Exiting"
+ 		          exit 14
+            else
+              echo "STATUS: Successfully deleted Target Group ${TARGETGROUP} of v2 load balancer ${ELB}. Continuing."
+          fi
+        done
+      else
+        echo "STATUS: No elb v2 load balancers ownerd by cluster ${CLUSTER}. Continuing."
+      fi
+    done
+  fi
+
+# Delete unassociated Target Groups.
+
+  for TARGP in `aws elbv2 describe-target-groups | grep TargetGroupArn | awk -F': ' '{print $2}' | sed s/\",$//g | sed s/^\"//g`
+  do
+    if [[ `aws elbv2 describe-tags --resource-arns ${TARGP} --out json | jq -ce '.TagDescriptions[].Tags[] | select( .Key == "kubernetes.io/cluster/'${CLUSTER}'" and .Value == "owned")' | grep -c ${CLUSTER}` -ge 1 ]]
+    then
+      aws elbv2 delete-target-group --target-group-arn ${TARGP}
+      if [ $? -ne 0 ]
+      then
+        echo "ERROR: Deleting unassociated Target Group elbv2 ${TARGP} failed. Exiting"
+        exit 13
+      else
+        echo "STATUS: Successfully deleted unassociated Target Group elbv2 ${TARGP}. Continuing."
+      fi
+    else
+      echo "STATUS: Not deleting Target Group ${TARGP}, not Owned by ${CLUSTER}. Continuing."
+    fi
+  done
+
+# Remove Terminate from ASG suspendeded processes to enable deletion
+	for ASGNAME in `aws autoscaling describe-auto-scaling-groups --profile ${PROFILE} --filters Name=tag-key,Values=eks:cluster-name Name=tag-value,Values=${CLUSTER} | grep AutoScalingGroupName | awk -F\" '{print $4}'`
+  do
+  	aws autoscaling resume-processes --auto-scaling-group-name ${ASGNAME} 
+  if [ $? -ne 0 ]
+  then
+ 	  echo "ERROR: Updating autoscaling group ${ASGNAME} failed. Exiting"
+ 	  exit 9
+  else
+    echo "STATUS: Update of autoscaling group ${ASGNAME} succeeded removing Terminate. Continuing."
+  fi
+	done
+
+  echo ""
+  echo "STATUS: DESTROY the old ${VIRENV} environment"
+  echo ""
+
+ 	echo "${PROFILE}" | terraform destroy -auto-approve
+ 	if [ $? -ne 0 ]
+ 	then
+ 		echo "ERROR: terraform destroy experienced errors for ${VIRENV} run. Exiting"
+ 		exit 2
+ 	fi
+
+# Clean up any lingering worker or storage nodes and any snapshots for this environment
+  echo "STATUS: Cleaning up Volumes and snapshots"
+
+  for REG in $(aws ec2 describe-regions --output text --query 'Regions[].[RegionName]' --region ${REGION})
+  do 
+    echo "STATUS: Region ${REG}" 
+    aws ec2 describe-volumes --filter "Name=status,Values=available" --query 'Volumes[*].{VolumeID:VolumeId,Size:Size,Type:VolumeType,AvailabilityZone:AvailabilityZone}' --region ${REG} | jq -r --unbuffered '.[].VolumeID' | xargs -n1 aws ec2 delete-volume --region ${REG} --volume-id
+
+    echo ${REG} && aws ec2 describe-snapshots --owner self --region ${REG} --output json --query "Snapshots[?(StartTime<='$(date -v -12m '+%Y-%m-%d')')].{ID:SnapshotId,Time:StartTime,Details:Description}" | jq -r --unbuffered '.[].ID' | xargs -n1 aws ec2 delete-snapshot --region ${REG} --snapshot-id
+  done
+fi
+
+if [[ "${EXISTS}" = "true" && ${VIRENV} = "gcp" ]]
+then
+  echo ""
+  echo "STATUS: DESTROY the old ${VIRENV} environment"
+  echo ""
+	terraform destroy -auto-approve
+  	if [ $? -ne 0 ]
+  	then
+  		echo "ERROR: terraform destroy experienced errors for ${VIRENV} run. Exiting"
+  		exit 2
+  	fi
+
+# Clean up any lingering worker or storage nodes
+###
+###  THIS NEEDS TO BE INVESTIGATED AND WRITTEN OR DETERMINED THAT NOTHING IS REQUIRED
+###
+
+fi
+
+if [[ ${2} != "" ]]
+then
+  echo "STATUS: Exiting after \"terraform destroy\". Exiting."
+  exit 0
+fi
+
+if [ "${EXISTS}" = "false" ]
+then
+	echo ""
+	echo "STATUS: No cluster to destroy"
+	echo ""
+fi
+
+# Clean init
+echo ""
+echo "STATUS: Initialize a new environment"
+echo ""
+terraform init
+if [ $? -ne 0 ]
+then
+	echo "ERROR: terraform init experienced errors for ${VIRENV} run. Exiting"
+	exit 3
+fi
+
+# validate the environment
+echo ""
+echo "STATUS: Validate the new environment"
+echo ""
+terraform validate
+if [ $? -ne 0 ]
+then
+	echo "ERROR: terraform validate experienced errors for ${VIRENV} run. Exiting"
+	exit 4
+fi
+
+# Create the plan in a file
+if [ ! -d ${HOME}/state/ ]
+then
+	mkdir ${HOME}/state/
+	if [ $? -ne 0 ]
+	then
+		echo "ERROR: State directory does not exist and could not be created. Exiting."
+		exit 5
+	fi
+fi
+
+echo ""
+echo "STATUS: Determine a new file name for the plan output"
+echo ""
+FIL="${HOME}/state/`date +%d%b%Y`-${VIRENV}.zip"
+NEW=0
+POST=1
+
+# Rotate the postpend until a file name is found that does not collide with existing files
+while [ ${NEW} = 0 ]
+do
+	if [ -f ${FIL} ]
+	then
+		# Pick a new file name
+		FIL="${HOME}/state/`date +%d%b%Y`-${VIRENV}-${POST}.zip"
+		((POST++))
+	else
+		NEW=1
+	fi
+done
+
+echo ""
+echo "STATUS: Plan output file name: ${FIL}"
+echo ""
+
+# Finally actually make the plan		
+echo ""
+echo "STATUS: Create the plan file for the individual dev environment"
+echo ""
+
+if [ "${VIRENV}" = "aws" ]
+then
+	###echo "${PROFILE}" | terraform plan -out=${FIL} -target=module.${CLUSTER}
+	echo "${PROFILE}" | terraform plan -out=${FIL}
+	if [ $? -ne 0 ]
+	then
+		echo "ERROR: terraform plan experienced errors for ${VIRENV} run. Exiting"
+		exit 6
+	fi
+else
+	terraform plan -out=${FIL}
+	if [ $? -ne 0 ]
+	then
+		echo "ERROR: terraform plan experienced errors for ${VIRENV} run. Exiting"
+		exit 6
+	fi
+fi
+
+# Do the Terraform DO - make it happen
+echo ""
+echo "STATUS: Apply the plan file for this module (users environment)"
+echo ""
+terraform apply "${FIL}"
+if [ $? -ne 0 ]
+then
+	echo "ERROR: terraform apply experienced errors for ${VIRENV} run. Exiting"
+	exit 7
+fi
+
+# update the profile for the new cluster
+if [ "${VIRENV}" = "aws" ]
+then
+	aws eks update-kubeconfig --name ${CLUSTER} 1>/dev/null 2>/dev/null
+else
+	echo "---GCP---"
+fi
+
+# Add terminate to ASG suspendeded processes to enable deletion
+if [ "${VIRENV}" = "aws" ]
+then
+	for ASGNAME in `aws autoscaling describe-auto-scaling-groups --profile ${PROFILE} --filters Name=tag-key,Values=eks:cluster-name Name=tag-value,Values=${CLUSTER} | grep AutoScalingGroupName | awk -F\" '{print $4}'`
+	do
+  		aws autoscaling suspend-processes --auto-scaling-group-name ${ASGNAME} --scaling-processes Terminate
+		if [ $? -ne 0 ]
+		then
+  			echo "ERROR: updating autoscaling group ${ASGNAME} failed. Exiting"
+  			exit 10
+		else
+			echo "STATUS: ${VIRENV} auto scaling group ${ASGNAME} idle processes set to Terminate. Continuing."
+		fi
+	done
+fi
+
+# give the entire group access
+
+## This should no longer be needed once the AIM based SSO is fully implemented and used.
+
+if [ "${VIRENV}" = "aws" ]
+then
+	###kubectl get -n kube-system configmap/aws-auth -o yaml > /tmp/$$
+	###LIN=$(grep -n 'kind: ConfigMap' /tmp/$$ | cut -d ":" -f 1)
+	###{ head -n $(($LIN-1)) /tmp/$$ ; cat ~/git/users ; tail -n +$LIN /tmp/$$ ; } > /tmp/$$.new
+	###kubectl patch configmap/aws-auth -n kube-system --patch "$(cat /tmp/$$.new)"
+	###rm -f /tmp/$$ /tmp/$$.new
+	###echo "STATUS: Entire DevOps group given access to ${VIRENV} cluster ${CLUSTER}."
+  kubectl replace --save-config -f ${TERRAFORMDIR}/aws-auth.yaml
+else
+	echo "---GCP---"
+fi
+
+# Update the kmsKeyID for the new cluster
+if [ "${VIRENV}" = "aws" ]
+then
+	aws kms describe-key --key-id alias/eks-hcvault-${CLUSTER} 1>/dev/null 2>/dev/null
+  if [ $? -ne 0 ]
+  then
+    echo "STATUS: Cluster key alias/eks-hcvault-${CLUSTER} does not exist. Continuing."
+  else
+	  KMSKEYID=`aws kms describe-key --key-id alias/eks-hcvault-${CLUSTER} | grep '"KeyId":' | awk -F\" '{print $4}'`
+
+	  LIN=$(grep -n 'kmsKeyID:' ${HOME}/git/infrastructure/terraform/providers/aws/cogynt/${REGION}/eks/${CLUSTER}/${CLUSTER}.env.yaml | grep -v "#" | tail -1 | cut -d ":" -f 1)
+	  { head -n $((${LIN}-1)) ${HOME}/git/infrastructure/terraform/providers/aws/cogynt/${REGION}/eks/${CLUSTER}/${CLUSTER}.env.yaml ; echo "    kmsKeyID: ${KMSKEYID}" ; tail -n +$((${LIN}+1)) ${HOME}/git/infrastructure/terraform/providers/aws/cogynt/${REGION}/eks/${CLUSTER}/${CLUSTER}.env.yaml ; } > ${HOME}/git/infrastructure/terraform/providers/aws/cogynt/${REGION}/eks/${CLUSTER}/${CLUSTER}.env.yaml.new
+	  mv ${HOME}/git/infrastructure/terraform/providers/aws/cogynt/${REGION}/eks/${CLUSTER}/${CLUSTER}.env.yaml.new ${HOME}/git/infrastructure/terraform/providers/aws/cogynt/${REGION}/eks/${CLUSTER}/${CLUSTER}.env.yaml
+
+	  ###LIN=$(grep -n 'kmsKeyID:' ${HOME}/git/cogynt-envs/eks/${CLUSTER}.yaml | cut -d ":" -f 1)
+	  ###{ head -n $((${LIN}-1)) ${HOME}/git/cogynt-envs/eks/${CLUSTER}.yaml ; echo "    kmsKeyID: ${KMSKEYID}" ; tail -n +$((${LIN}+1)) ${HOME}/git/cogynt-envs/eks/${CLUSTER}.yaml ; } > ${HOME}/git/cogynt-envs/eks/${CLUSTER}.yaml.new
+	  ###mv ${HOME}/git/cogynt-envs/eks/${CLUSTER}.yaml.new ${HOME}/git/cogynt-envs/eks/${CLUSTER}.yaml
+
+	  echo "STATUS: Updated ${VIRENV} kmsKeyID to correct value for new cluster ${CLUSTER}."
+  fi
+else
+	echo "---GCP---"
+fi
+
+cd ${HOME}/git/cogynt-delivery
+
+set -x
+echo "LOGGING: Dumping the users shell envirnment."
+echo ""
+env
+echo ""
+echo ""
+set +x
+
+# Start the go process to deploy the software on the environment
+echo ""
+echo "STATUS: Running the go process to deploy the software to the ${VIRENV} k8s environment."
+echo ""
+if [ "${VIRENV}" = "aws" ]
+then
+  GOCMD="go run ${HOME}/git/cogynt-delivery/cmd/kubectl-cogynt/main.go apply -f  ${HOME}/git/infrastructure/terraform/providers/${VIRENV}/cogynt/${REGION}/${K8SSYSTEM}/${CLUSTER}/${CLUSTER}.env.yaml --tlspem ${HOME}/git/infrastructure/ssl-certs/star_cogilitycloud_com.cer --tlskey ${HOME}/git/infrastructure/ssl-certs/star_cogilitycloud_com.key --clusterName ${CLUSTER} --storePath ${HOME}/git/infrastructure/terraform/providers/${VIRENV}/cogynt/${REGION}/${K8SSYSTEM}/${CLUSTER}/${CLUSTER}.db --debug"
+
+else  # GCP
+
+  # Wait for cluster to be in "RUNNING" state
+  # Could take 30 - 60 minutes
+  echo ""
+  echo "STATUS: Waiting for the ${CLUSTER} cluster to be in a stable \"RUNNING\" state before initiating the software deployment."
+  echo ""
+
+  WCNT=0
+  WTIM=0
+  while [[ ${WCNT} -le 4 ]]
+  do
+    CSTATE="`gcloud container clusters list 2>/dev/null | grep ^${CLUSTER} | awk '{print $8}'`"
+    if [[ ${CSTATE} != "RUNNING" ]]
+    then
+      WCNT=0
+    else
+      let WCNT+=1
+    fi
+
+    let WTIM+=5
+    printf "STATUS: GCP state %-12s - sleeping 5 minutes. Waiting %3.0u minutes for cluster to be in stable RUNNING state at `date`.\n" ${CSTATE} ${WTIM}
+    sleep 300
+  done
+
+  echo ""
+  echo "STATUS: The ${CLUSTER} cluster is stable in a \"RUNNING\" state. Beginning the software deploy."
+  echo ""
+
+  echo ""
+  echo ""
+
+###
+### This method of reflecting the information to the user needs to be improved.
+###
+
+set -x
+
+  gcloud compute firewall-rules update $(gcloud compute firewall-rules list --filter="name~gke-${CLUSTER}-[0-9a-z]*-master" --format=json | jq -r '.[0].name') --allow tcp:10250,tcp:443,tcp:15017
+
+	gcloud container clusters get-credentials ${CLUSTER} --region ${REGION}
+
+set +x
+
+  gcloud container clusters list 2>/dev/null | grep ^${CLUSTER}
+
+  GOCMD="go run ${HOME}/git/cogynt-delivery/cmd/kubectl-cogynt/main.go apply -f  ${HOME}/git/infrastructure/terraform/providers/${VIRENV}/cogynt/${REGION}/${K8SSYSTEM}/${CLUSTER}/${CLUSTER}.env.yaml --tlspem ${HOME}/git/infrastructure/ssl-certs/star_cogilitycloud_com.cer --tlskey ${HOME}/git/infrastructure/ssl-certs/star_cogilitycloud_com.key --clusterName ${CLUSTER} --storePath ${HOME}/git/infrastructure/terraform/providers/${VIRENV}/cogynt/${REGION}/${K8SSYSTEM}/${CLUSTER}/${CLUSTER}.db --debug"
+fi
+
+echo ""
+echo "STATUS: Command to be run to deploy the Cogynt cluster ${CLUSTER} in ${VIRENV} at `date`"
+echo ""
+
+echo ${GOCMD}
+
+echo ""
+echo "`date`"
+echo ""
+
+${GOCMD}
+
+if [ $? -ne 0 ]
+then
+	echo ""
+	echo "ERROR: The software deploy 'go run' experienced errors for the ${CLUSTER} cluster in ${VIRENV}. Exiting"
+	echo ""
+	echo "ERROR: Please investigate output and logs to identify and remedy the issues."
+   echo ""
+   echo "ERROR: Process started  at:   ${START}"
+   echo "ERROR: Process completion at: `date`"
+   echo ""
+   echo ""
+   echo "ERROR: Returning to original directory ${OPWD}."
+   echo ""
+   cd ${OPWD}
+	exit 8
+
+else #  we did it!
+
+  echo ""
+  echo "STATUS:  ------SUCCESS------"
+  echo ""
+  echo "STATUS: Process started  at:   ${START}"
+  echo "STATUS: Process completion at: `date`"
+  echo ""
+
+  # Return to the directory that we started from
+  echo ""
+  echo "STATUS: Returning to original directory ${OPWD}."
+  echo ""
+  cd ${OPWD}
+  echo ""
+
+fi
+
+##
+## That's all folks
+##
+exit 0
+
